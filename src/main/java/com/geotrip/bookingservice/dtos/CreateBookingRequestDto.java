@@ -1,6 +1,5 @@
 package com.geotrip.bookingservice.dtos;
 
-import com.geotrip.entityservice.models.ExactLocation;
 import jakarta.validation.constraints.NotNull;
 import lombok.*;
 

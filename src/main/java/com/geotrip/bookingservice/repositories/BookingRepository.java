@@ -14,6 +14,4 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
     List<Booking> findByDriverId(UUID driverId);
     List<Booking> findByDriverIsNullAndBookingStatus(BookingStatus bookingStatus);
     Boolean existsByPassengerIdAndBookingStatusIn(UUID passengerId, List<BookingStatus> bookingStatuses);
-
-    Optional<Booking> findByIdAndDriverIsNull(UUID bookingId);
 }

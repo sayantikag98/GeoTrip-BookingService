@@ -1,8 +1,6 @@
 package com.geotrip.bookingservice.dtos;
 
-import jakarta.validation.constraints.NotNull;
 import lombok.*;
-
 import java.util.UUID;
 
 
