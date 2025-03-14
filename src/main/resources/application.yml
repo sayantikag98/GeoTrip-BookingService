@@ -1,6 +1,6 @@
 spring:
   application:
-    name: BookingService
+    name: BOOKING-SERVICE
 
   datasource:
     url: ${DB_URL}
