@@ -3,18 +3,26 @@ package com.geotrip.bookingservice.services;
 
 import com.geotrip.bookingservice.clients.LocationServiceClient;
 import com.geotrip.bookingservice.dtos.*;
+import com.geotrip.bookingservice.headers.SecurityContextHeader;
 import com.geotrip.bookingservice.repositories.BookingRepository;
 import com.geotrip.bookingservice.repositories.DriverRepository;
+import com.geotrip.bookingservice.repositories.ExactLocationRepository;
 import com.geotrip.bookingservice.repositories.PassengerRepository;
 import com.geotrip.entityservice.models.*;
 import com.geotrip.exceptionhandler.AppException;
 import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -26,15 +34,27 @@ public class BookingServiceImpl implements BookingService {
     private final PassengerRepository passengerRepository;
     private final DriverRepository driverRepository;
     private final LocationServiceClient locationServiceClient;
+    private final SecurityContextHeader securityContextHeader;
+    private final Logger logger;
+    private final ExactLocationRepository exactLocationRepository;
 
     //TODO: scheduled booking flow
 
     @Transactional
-    public BookingDto createBooking(UserDto userDto, CreateBookingRequestDto createBookingRequestDto) {
-        if(userDto.getId() == null) throw new IllegalArgumentException("Passenger id cannot be null");
-        Passenger passenger = passengerRepository.findById(userDto.getId()).orElseThrow(() -> new AppException("Passenger not found", HttpStatus.NOT_FOUND));
+    public BookingDto createBooking(CreateBookingRequestDto createBookingRequestDto) {
 
-        Boolean activeBookings = bookingRepository.existsByPassengerIdAndBookingStatusIn(userDto.getId(), List.of(
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+
+        if(authentication == null || !authentication.isAuthenticated()) {
+            throw new AppException("Not Authenticated", HttpStatus.UNAUTHORIZED);
+        }
+
+        String email = authentication.getName();
+        System.out.println("Email: "+email);
+
+        Passenger passenger = passengerRepository.findByEmail(email).orElseThrow(() -> new AppException("Passenger not found", HttpStatus.NOT_FOUND));
+
+        Boolean activeBookings = bookingRepository.existsBookingByPassengerEmailAndBookingStatusIn(email, List.of(
                 BookingStatus.REQUESTED,
                 BookingStatus.SEARCHING_DRIVER,
                 BookingStatus.DRIVER_ASSIGNED,
@@ -46,20 +66,18 @@ public class BookingServiceImpl implements BookingService {
 
         Booking booking = Booking.builder()
                 .passenger(passenger)
-                .pickupLocation(ExactLocation.builder()
-                        .longitude(createBookingRequestDto.getPickupLocation().getLongitude())
-                        .latitude(createBookingRequestDto.getPickupLocation().getLatitude())
-                        .build()
+                .pickupLocation(
+                        findOrCreateExactLocation(createBookingRequestDto.getPickupLocation())
                 )
-                .dropoffLocation(ExactLocation.builder()
-                        .longitude(createBookingRequestDto.getDropOffLocation().getLongitude())
-                        .latitude(createBookingRequestDto.getDropOffLocation().getLatitude())
-                        .build()
+                .dropoffLocation(
+                        findOrCreateExactLocation(createBookingRequestDto.getDropOffLocation())
                 )
                 .bookingStatus(BookingStatus.REQUESTED)
                 .build();
 
-        bookingRepository.save(booking);
+        bookingRepository.saveAndFlush(booking);
+
+        assignBookingToDriver(booking.getId());
 
         return BookingDto.builder()
                 .bookingStatus(booking.getBookingStatus())
@@ -113,79 +131,94 @@ public class BookingServiceImpl implements BookingService {
     }
 
 
+    @Async
     @Transactional
-    public BookingDto assignBookingToDriver(UUID bookingId) {
-        Booking booking = bookingRepository.findById(bookingId).orElseThrow(() -> new AppException("Booking not found", HttpStatus.NOT_FOUND));
+    public void assignBookingToDriver(UUID bookingId) {
+        try{
+            Booking booking = bookingRepository.findById(bookingId).orElseThrow(() -> new AppException("Booking not found", HttpStatus.NOT_FOUND));
 
-        if(booking.getDriver() != null) throw new AppException("Driver already assigned to this booking", HttpStatus.BAD_REQUEST);
+            if(booking.getDriver() != null) throw new AppException("Driver already assigned to this booking", HttpStatus.BAD_REQUEST);
 
-        if(booking.getBookingStatus() != BookingStatus.REQUESTED && booking.getBookingStatus() != BookingStatus.SEARCHING_DRIVER) {
-            throw new AppException("Booking status is not valid to assign driver", HttpStatus.BAD_REQUEST);
-        }
+            if(booking.getBookingStatus() != BookingStatus.REQUESTED && booking.getBookingStatus() != BookingStatus.SEARCHING_DRIVER) {
+                throw new AppException("Booking status is not valid to assign driver", HttpStatus.BAD_REQUEST);
+            }
 
-        if(booking.getBookingStatus() == BookingStatus.REQUESTED) {
-            booking.setBookingStatus(BookingStatus.SEARCHING_DRIVER);
-            bookingRepository.save(booking);
-        }
+            if(booking.getBookingStatus() == BookingStatus.REQUESTED) {
+                booking.setBookingStatus(BookingStatus.SEARCHING_DRIVER);
+                bookingRepository.save(booking);
+            }
 
-        double radius = 2.0;
-        final double maxRadius = 10.0;
-        final long limit = 5L;
+            double radius = 2.0;
+            final double maxRadius = 10.0;
+            final long limit = 5L;
 
-        Driver assignedDriver = null;
+            Driver assignedDriver = null;
 
-        while(radius <= maxRadius) {
+            while(radius <= maxRadius) {
 
-            FindNearbyDriverRequestDto findNearbyDriverRequestDto = FindNearbyDriverRequestDto.builder()
-                                                                    .exactLocationDto(new ExactLocationDto(booking.getPickupLocation()))
-                                                                    .radius(radius)
-                                                                    .limit(limit)
-                                                                    .build();
+                FindNearbyDriverRequestDto findNearbyDriverRequestDto = FindNearbyDriverRequestDto.builder()
+                        .exactLocationDto(new ExactLocationDto(booking.getPickupLocation()))
+                        .radius(radius)
+                        .limit(limit)
+                        .build();
 
-            ResponseEntity<List<DriverLocationDto>> nearbyDriverListResponse = locationServiceClient.getNearbyDrivers(findNearbyDriverRequestDto);
-            List<DriverLocationDto> nearbyDriverList = nearbyDriverListResponse.getBody();
+                HttpHeaders headers = securityContextHeader.createAuthenticationHeader();
+                ResponseEntity<List<DriverLocationDto>> nearbyDriverListResponse = locationServiceClient.getNearbyDrivers(findNearbyDriverRequestDto, headers);
+                List<DriverLocationDto> nearbyDriverList = nearbyDriverListResponse.getBody();
 
-            if(nearbyDriverList != null){
-                for(DriverLocationDto driverLocationDto : nearbyDriverList){
-                    Driver driver = driverRepository.findById(driverLocationDto.getDriverId()).orElse(null);
-                    if(
-                            driver != null &&
-                            driver.isActive() &&
-                            driver.isEnabled() &&
-                            driver.getIsLicenseNumberVerified() &&
-                            driver.getApprovalStatus() == DriverApprovalStatus.APPROVED
-                    ){
-                        assignedDriver = driver;
-                        break;
+                if(nearbyDriverList != null){
+                    for(DriverLocationDto driverLocationDto : nearbyDriverList){
+
+                        Boolean isDriverBusy = bookingRepository.existsBookingByDriverIdAndBookingStatusIn(
+                                driverLocationDto.getDriverId(),
+                                List.of(
+                                        BookingStatus.DRIVER_ASSIGNED,
+                                        BookingStatus.DRIVER_ARRIVING,
+                                        BookingStatus.IN_PROGRESS
+                                )
+                        );
+
+                        if(isDriverBusy) {
+                            continue;
+                        }
+
+                        Driver driver = driverRepository.findById(driverLocationDto.getDriverId()).orElse(null);
+                        if(
+                                driver != null &&
+                                        driver.isActive() &&
+                                        driver.isEnabled() &&
+                                        driver.getIsLicenseNumberVerified() &&
+                                        driver.getApprovalStatus() == DriverApprovalStatus.APPROVED
+                        ){
+                            assignedDriver = driver;
+                            break;
+                        }
                     }
                 }
+
+                if(assignedDriver != null){
+                    break;
+                }
+
+                radius += 2.0;
             }
 
-            if(assignedDriver != null){
-                break;
+            if(assignedDriver == null){
+                //TODO: notify passenger about no driver found
+                logger.info("No available driver found for the ride");
+                throw new AppException("No available driver found for the ride", HttpStatus.NOT_FOUND);
             }
 
-            radius += 2.0;
+            booking.setDriver(assignedDriver);
+            booking.setBookingStatus(BookingStatus.DRIVER_ASSIGNED);
+            bookingRepository.save(booking);
+
+            //TODO: notify driver and passenger about this booking
+        }
+        catch(Exception exception){
+            System.out.println(exception.getMessage());
         }
 
-        if(assignedDriver == null){
-            throw new AppException("No available driver found for the ride", HttpStatus.NOT_FOUND);
-        }
-
-        booking.setDriver(assignedDriver);
-        booking.setBookingStatus(BookingStatus.DRIVER_ASSIGNED);
-        bookingRepository.save(booking);
-
-        return BookingDto.builder()
-                .bookingStatus(booking.getBookingStatus())
-                .startTime(booking.getStartTime())
-                .endTime(booking.getEndTime())
-                .scheduledAt(booking.getScheduledAt())
-                .pickupLocation(new ExactLocationDto(booking.getPickupLocation()))
-                .dropoffLocation(new ExactLocationDto(booking.getDropoffLocation()))
-                .passenger(new PassengerDto(booking.getPassenger()))
-                .driver(new DriverDto(booking.getDriver()))
-                .build();
     }
 
     private List<BookingDto> convertBookingListToBookingDtoList(List<Booking> bookings) {
@@ -202,6 +235,23 @@ public class BookingServiceImpl implements BookingService {
                         .build()
                 )
                 .collect(Collectors.toList());
+    }
+
+    private ExactLocation findOrCreateExactLocation(ExactLocationDto exactLocationDto) {
+        Double longitude = exactLocationDto.getLongitude();
+        Double latitude = exactLocationDto.getLatitude();
+
+        Optional<ExactLocation> exactLocation = exactLocationRepository.findExactLocationByLongitudeAndLatitude(longitude, latitude);
+        if(exactLocation.isPresent()) {
+            return exactLocation.get();
+        }
+        return exactLocationRepository.save(
+                    ExactLocation.builder()
+                            .longitude(exactLocationDto.getLongitude())
+                            .latitude(exactLocationDto.getLatitude())
+                            .build()
+            );
+
     }
 
 }

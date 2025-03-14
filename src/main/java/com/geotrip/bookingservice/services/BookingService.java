@@ -6,7 +6,7 @@ import java.util.List;
 import java.util.UUID;
 
 public interface BookingService {
-    BookingDto createBooking(UserDto userDto, CreateBookingRequestDto createBookingRequestDto);
+    BookingDto createBooking(CreateBookingRequestDto createBookingRequestDto);
 
     BookingDto getBookingById(UUID bookingId);
 
@@ -16,5 +16,5 @@ public interface BookingService {
 
     List<BookingDto> getAllAvailableBookings();
 
-    BookingDto assignBookingToDriver(UUID bookingId);
+    void assignBookingToDriver(UUID bookingId);
 }
